@@ -1,2 +1,2 @@
 # trading-cpp
-build fellow project
+A C++ trading exchange with an order book, matching engine, and order processing system.
