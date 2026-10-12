@@ -1,0 +1,14 @@
+# C++ standard (applies to all targets)
+build --cxxopt=-std=c++26
+
+# Build verbosity
+build --verbose_failures
+build --announce_rc
+
+# Named configs — use with: bazel build -c dbg //...
+build:dbg --cxxopt=-O0 --cxxopt=-g
+build:opt --cxxopt=-O2
+
+# Convenience alias so `bazel build --config=asan` works
+build:asan --cxxopt=-fsanitize=address --linkopt=-fsanitize=address
+build:asan --cxxopt=-O1 --cxxopt=-g
