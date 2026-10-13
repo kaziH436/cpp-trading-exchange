@@ -40,3 +40,5 @@ compile_commands.json
 # Crash dumps
 core
 core.*
+
+MODULE.bazel.lock
