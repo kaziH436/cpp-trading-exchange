@@ -77,3 +77,32 @@ std::vector<int>
 - Fixed-size blocks indexed by a map of pointers.
 - `push_front`, `push_back` are O(1).
 - Random access possible?
+
+### Lvalue VS Rvalue 
+An lvalue is an expression that refers to an object with a persistent identity, meaning it has a name or address you can take (&x works).
+An rvalue is a temporary value with no persistent identity, something you can’t take the address of (&5 is an error but &&5 works).
+
+
+    int x = 5;
+    int y = x;   // x is an lvalue
+
+### Placement new 
+new keyword means kernel returns a space to construct an object. This may not be the best option has kernel needs to find the best place to handle the dynamic memory allocation. 
+
+    Base *obj = new Base()
+    delete obj;
+  
+placement new solves this by 
+
+    char *memory = new char[10*sizeof(Base)]; // this is the memory pool and the memory from the kernel is once instead of multiple times aka heap allocation
+    //e.g. if memory -> [40]
+    Base *obj1 = new (&memory[0]) Base(); 
+    Base *obj2 = new (&memory[4]) Base(); 
+    Base *obj3 = new (&memory[8]) Base(); 
+
+    obj1->~Base(); //destructs the memory
+    obj2->~Base(); 
+    obj3->~Base(); 
+
+    delete[] memory; //frees the buffer
+    
