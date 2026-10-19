@@ -34,26 +34,38 @@ public:
         for (size_t i = 0; i < in_use.size(); ++i) { // iterate through vector 1 (status) to check if vector 2 (holding objects) has a free space
             if (!in_use[i]) { // if a slot is not in use 
                 in_use[i]=1; // make use of it 
-                void *raw_memory = slots[i].storage; // address of slot i's bytes
+                void *raw_memory = slots[i].storage; // address of slot i's 
                 
                 // placement new 
-                T *obj = new (raw_memory) T(args...); //build the T object
-                return obj; 
+                T* obj = new (raw_memory)
+                        T(std::forward<Args>(args)...); //forward helps take both r and lvalues
+                return obj;     
             }
 
         }
         return nullptr; // no free slot 
-    } 
+    } // time complexity O(n)
+
     // noexcept is a promise about behavoir, the function won't let an exception pass and it will crash first if there is an exception 
 
 
-    void deallocate(const T *elem) noexcept{ 
-        if (!elem) return;
-        auto index = reinterpret_cast<const Slot *>(elem) - slots.data(); // slots.data start of the bytes address
-        elem->~T(); // freed up space
-        in_use[index] = 0;
+    void deallocate(const T* elem) noexcept {
+        if (!elem) return; // if nullptr, return
 
-    }
+        for (size_t i = 0; i < slots.size(); ++i) {
+            
+            // compares the memory addresses of elem and i; ensures the pointers are of same type
+            if (static_cast<const void*>(elem) == static_cast<const void*>(slots[i].storage)) {
+
+                if (!in_use[i]) return; // if not in use, return 
+
+                // removes const qualification from the pointer to deconstruct the object T
+                const_cast<T*>(elem)->~T(); 
+                in_use[i] = 0;
+                return;
+            }
+        }
+    } // time complexity O(n)
 
     
     MemPool()=delete("a MemPool owns its backing storage and free list");
@@ -64,7 +76,8 @@ public:
 
     private:
         struct Slot { 
-            alignas(T) byte storage[sizeof(T)];
+            //stores bytes for 1 T and ensures its aligned since string or int will be aligned differently
+            alignas(T) byte storage[sizeof(T)]; 
         };
         vector<Slot> slots; 
         vector<char> in_use;  // vector<bool> is not good implementation as it doesn't stores bool values 

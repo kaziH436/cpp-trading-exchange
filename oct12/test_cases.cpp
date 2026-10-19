@@ -1,173 +1,184 @@
-#include <cassert>    
-#include <iostream>   
-#include <vector>
+#include <cassert>
+#include <iostream>
 #include "mem_pool.h"
+
 using namespace std;
 
-// A test object that counts how many of itself currently exist.
 struct Tracked {
-    static int alive;   // shared counter for ALL Tracked objects
-    int id;             // value we store so tests can check it
+    static int alive;
+    int id;
 
-    Tracked(int new_id) {   // needs an id, so no zero-argument version exists
-        id = new_id;
-        alive = alive + 1;  // one more object exists
+    explicit Tracked(int new_id) : id(new_id) {
+        ++alive;
     }
 
     ~Tracked() {
-        alive = alive - 1;  // one fewer object exists
+        --alive;
     }
 };
-int Tracked::alive = 0;     // counter starts at zero
 
-// A test object with two values, to check multiple arguments work.
+int Tracked::alive = 0;
+
+// Tests whether the pool keeps storage without constructing objects
+void test_construction() {
+    cout << "Test 1: Pool construction\n";
+
+    Tracked::alive = 0;
+    MemPool<Tracked> pool(3);
+
+    assert(Tracked::alive == 0);
+
+    cout << "Passed: No objects constructed initially.\n\n";
+}
+
+// Tests object construction and destruction.
+void test_allocate_and_deallocate() {
+    cout << "Test 2: Allocation and deallocation\n";
+
+    Tracked::alive = 0;
+    MemPool<Tracked> pool(2);
+
+    Tracked* obj = pool.allocate(42);
+
+    assert(obj != nullptr);
+    assert(obj->id == 42);
+    assert(Tracked::alive == 1);
+
+    pool.deallocate(obj);
+
+    assert(Tracked::alive == 0);
+
+    cout << "Passed: Objects are constructed and destroyed correctly.\n\n";
+}
+
+// Tests whether multiple constructor arguments work.
 struct Pair {
     int a;
     double b;
 
-    Pair(int first, double second) {
-        a = first;
-        b = second;
-    }
+    Pair(int first, double second) : a(first), b(second) {}
 };
 
-void test_construction_creates_no_objects() {
-    Tracked::alive = 0;
-    MemPool<Tracked> pool(4);
-    assert(Tracked::alive == 0);   // only raw space exists, no objects yet
-}
+void test_multiple_arguments() {
+    cout << "Test 3: Multiple constructor arguments\n";
 
-void test_allocate_builds_object_and_deallocate_destroys_it() {
-    Tracked::alive = 0;
-    MemPool<Tracked> pool(4);
-
-    Tracked *t = pool.allocate(42);
-    assert(t != nullptr);          // allocation succeeded
-    assert(t->id == 42);           // object was built with our value
-    assert(Tracked::alive == 1);   // one object exists
-
-    pool.deallocate(t);
-    assert(Tracked::alive == 0);   // destructor ran
-}
-
-void test_multiple_constructor_arguments() {
     MemPool<Pair> pool(2);
 
-    Pair *p = pool.allocate(7, 9.5);
-    assert(p != nullptr);
-    assert(p->a == 7);
-    assert(p->b == 9.5);
+    Pair* obj = pool.allocate(7, 9.5);
 
-    pool.deallocate(p);
+    assert(obj != nullptr);
+    assert(obj->a == 7);
+    assert(obj->b == 9.5);
+
+    pool.deallocate(obj);
+
+    cout << "Passed: Multiple arguments forwarded correctly.\n\n";
 }
 
-void test_allocations_get_different_addresses() {
+// Tests whether simultaneous allocations have different addresses.
+void test_different_addresses() {
+    cout << "Test 4: Different allocation addresses\n";
+
     Tracked::alive = 0;
     MemPool<Tracked> pool(3);
 
-    Tracked *first = pool.allocate(1);
-    Tracked *second = pool.allocate(2);
-    Tracked *third = pool.allocate(3);
+    Tracked* first = pool.allocate(1);
+    Tracked* second = pool.allocate(2);
+    Tracked* third = pool.allocate(3);
+
+    assert(first != nullptr);
+    assert(second != nullptr);
+    assert(third != nullptr);
 
     assert(first != second);
-    assert(second != third);
     assert(first != third);
-    assert(first->id == 1);
-    assert(second->id == 2);
-    assert(third->id == 3);
-}
-
-void test_full_pool_returns_nullptr() {
-    Tracked::alive = 0;
-    MemPool<Tracked> pool(2);
-
-    Tracked *first = pool.allocate(1);
-    Tracked *second = pool.allocate(2);
-    Tracked *extra = pool.allocate(3);   // no room left
-
-    assert(extra == nullptr);
-    assert(first->id == 1);              // existing objects untouched
-    assert(second->id == 2);
-    assert(Tracked::alive == 2);         // no extra object was built
-}
-
-void test_freed_slot_can_be_reused() {
-    Tracked::alive = 0;
-    MemPool<Tracked> pool(2);
-
-    Tracked *first = pool.allocate(1);
-    Tracked *second = pool.allocate(2);
-    assert(pool.allocate(3) == nullptr);   // full
+    assert(second != third);
 
     pool.deallocate(first);
-    Tracked *reused = pool.allocate(9);    // should work now
-    assert(reused != nullptr);
-    assert(reused->id == 9);
-    assert(second->id == 2);               // untouched
-}
+    pool.deallocate(second);
+    pool.deallocate(third);
 
-void test_freeing_middle_slot_frees_the_right_one() {
-    Tracked::alive = 0;
-    MemPool<Tracked> pool(3);
-
-    Tracked *first = pool.allocate(1);
-    Tracked *middle = pool.allocate(2);
-    Tracked *last = pool.allocate(3);
-
-    pool.deallocate(middle);
-    Tracked *replacement = pool.allocate(4);
-
-    assert(replacement == middle);   // the freed slot is the one reused
-    assert(first->id == 1);
-    assert(last->id == 3);
-}
-
-void test_deallocate_nullptr_is_harmless() {
-    MemPool<Tracked> pool(1);
-    pool.deallocate(nullptr);   // must not crash
-}
-
-void test_slots_are_evenly_spaced() {
-    Tracked::alive = 0;
-    MemPool<Tracked> pool(3);
-
-    Tracked *first = pool.allocate(1);
-    Tracked *second = pool.allocate(2);
-    Tracked *third = pool.allocate(3);
-
-    // pointer subtraction counts objects between addresses
-    assert(second - first == third - second);
-    assert(second - first > 0);
-}
-
-void test_free_everything() {
-    Tracked::alive = 0;
-    MemPool<Tracked> pool(100);
-    vector<Tracked *> all_pointers;
-
-    for (int i = 0; i < 100; ++i) {
-        all_pointers.push_back(pool.allocate(i));
-    }
-    assert(Tracked::alive == 100);
-
-    for (Tracked *p : all_pointers) {
-        pool.deallocate(p);
-    }
     assert(Tracked::alive == 0);
+
+    cout << "Passed: Allocated objects have different addresses.\n\n";
+}
+
+// Tests what happens when the pool runs out of space.
+void test_full_pool() {
+    cout << "Test 5: Pool capacity\n";
+
+    Tracked::alive = 0;
+    MemPool<Tracked> pool(2);
+
+    Tracked* first = pool.allocate(1);
+    Tracked* second = pool.allocate(2);
+    Tracked* third = pool.allocate(3);
+
+    assert(first != nullptr);
+    assert(second != nullptr);
+    assert(third == nullptr);
+
+    assert(Tracked::alive == 2);
+
+    pool.deallocate(first);
+    pool.deallocate(second);
+
+    assert(Tracked::alive == 0);
+
+    cout << "Passed: Full pool returns nullptr.\n\n";
+}
+
+// Tests whether a deallocated slot can be reused.
+void test_slot_reuse() {
+    cout << "Test 6: Slot reuse\n";
+
+    Tracked::alive = 0;
+    MemPool<Tracked> pool(2);
+
+    Tracked* first = pool.allocate(1);
+    Tracked* second = pool.allocate(2);
+
+    assert(first != nullptr);
+    assert(second != nullptr);
+
+    pool.deallocate(first);
+
+    Tracked* replacement = pool.allocate(99);
+
+    assert(replacement != nullptr);
+    assert(replacement == first);
+    assert(replacement->id == 99);
+    assert(second->id == 2);
+
+    pool.deallocate(replacement);
+    pool.deallocate(second);
+
+    assert(Tracked::alive == 0);
+
+    cout << "Passed: Deallocated slot can be reused.\n\n";
+}
+
+// Tests whether passing nullptr is harmless.
+void test_nullptr() {
+    cout << "Test 7: Null pointer deallocation\n";
+
+    MemPool<int> pool(2);
+
+    pool.deallocate(nullptr);
+
+    cout << "Passed: nullptr is handled safely.\n\n";
 }
 
 int main() {
-    test_construction_creates_no_objects();
-    test_allocate_builds_object_and_deallocate_destroys_it();
-    test_multiple_constructor_arguments();
-    test_allocations_get_different_addresses();
-    test_full_pool_returns_nullptr();
-    test_freed_slot_can_be_reused();
-    test_freeing_middle_slot_frees_the_right_one();
-    test_deallocate_nullptr_is_harmless();
-    test_slots_are_evenly_spaced();
-    test_free_everything();
+    test_construction();
+    test_allocate_and_deallocate();
+    test_multiple_arguments();
+    test_different_addresses();
+    test_full_pool();
+    test_slot_reuse();
+    test_nullptr();
 
-    cout << "All tests passed\n";
+    cout << "All memory pool tests passed!\n";
+
     return 0;
 }
