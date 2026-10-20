@@ -5,7 +5,7 @@
 using namespace std;
 
 struct Tracked {
-    static int alive;
+    static int alive; // shared variable across all objects of Tracked
     int id;
 
     explicit Tracked(int new_id) : id(new_id) {
@@ -31,7 +31,7 @@ void test_construction() {
     cout << "Passed: No objects constructed initially.\n\n";
 }
 
-// Tests object construction and destruction.
+// Tests object construction and destruction
 void test_allocate_and_deallocate() {
     cout << "Test 2: Allocation and deallocation\n";
 
@@ -51,7 +51,7 @@ void test_allocate_and_deallocate() {
     cout << "Passed: Objects are constructed and destroyed correctly.\n\n";
 }
 
-// Tests whether multiple constructor arguments work.
+// Tests if multiple constructor arguments work
 struct Pair {
     int a;
     double b;
