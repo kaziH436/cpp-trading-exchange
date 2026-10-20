@@ -1,18 +1,13 @@
 // Using the two design choices provded:
 // 1. a single vector to track is_free or in_use: depending on that put the object
-// 2. two vectors: one for is_free or in_use vector and one for object vector for adding/removing
-
-// 1. What are the difference between the two design choices e.g. time complexity or space complexity 
-// 2. Code the memory pool implementation using both the design choices 
-// 3. Add test cases to see how the two design choices compare
 
 // Memory Pool coding 
 // Eliminate heap allocation at runtime (pre-allocate everything upfront)​: must be fixed size though vector is dynamic memory
-// Keep hot objects cache-local in a contiguous vector​
+// Keep hot objects cache-local in a contiguous vector​? 
 // Avoid any per-allocation overhead​
 
 
-
+// add the error messages, throw an exception using try except 
 #include <vector>
 #include <cstddef>
 #include <new>
@@ -24,7 +19,7 @@ class MemPool final {
 public: 
 
     // constructor
-    explicit MemPool(size_t num_elems): slots(num_elems), in_use(num_elems, 0) {}
+    explicit MemPool(size_t num_elems): slots(num_elems), in_use(num_elems, false) {}
     // in_use is intialized with 0
         
 
@@ -33,7 +28,7 @@ public:
     T *allocate(Args &&...args) noexcept{ 
         for (size_t i = 0; i < in_use.size(); ++i) { // iterate through vector 1 (status) to check if vector 2 (holding objects) has a free space
             if (!in_use[i]) { // if a slot is not in use 
-                in_use[i]=1; // make use of it 
+                in_use[i]=true; // make use of it 
                 void *raw_memory = slots[i].storage; // address of slot i's 
                 
                 // placement new 
@@ -61,7 +56,7 @@ public:
 
                 // removes const qualification from the pointer to deconstruct the object T
                 const_cast<T*>(elem)->~T(); 
-                in_use[i] = 0;
+                in_use[i] = false;
                 return;
             }
         }
@@ -80,5 +75,5 @@ public:
             alignas(T) byte storage[sizeof(T)]; 
         };
         vector<Slot> slots; 
-        vector<char> in_use;  // vector<bool> is not good implementation as it doesn't stores bool values 
+        vector<bool> in_use;  // vector<bool> is not good implementation as it doesn't stores bool values 
 }; 
