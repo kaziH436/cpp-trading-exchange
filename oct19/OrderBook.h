@@ -1,7 +1,7 @@
 #pragma once
 
-#include "MemPool.h"
-#include "Order.h"
+#include "../oct12/mem_pool.h"
+#include "order.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -39,7 +39,7 @@ public:
         : ticker_(validatedTicker(ticker)), pool_(poolCapacity) {
         orderIdToIndex_.reserve(poolCapacity);
         heldMarketOrderIndices_.reserve(poolCapacity);
-    }
+    };
 
     OrderBook() = delete;
     OrderBook(const OrderBook&) = delete;
@@ -81,29 +81,29 @@ public:
         // Keep the incoming order in the pool while it is being matched, as in
         // the supplied pseudocode. Capacity must allow a slot for this order.
         const auto incomingIndex = pool_.allocate(std::move(incoming));
-        if (!incomingIndex) {
+        if (incomingIndex == MemPool<Order>::kInvalidIndex) {
             return {SubmitStatus::PoolFull, id, submittedRemaining};
         }
 
-        match(*incomingIndex);
+        match(incomingIndex);
 
-        Order& processed = pool_.get(*incomingIndex);
+        Order& processed = pool_.get(incomingIndex);
         if (processed.remaining == 0) {
             const Quantity remaining = processed.remaining;
-            pool_.deallocate(*incomingIndex);
+            pool_.deallocate(incomingIndex);
             return {SubmitStatus::FilledCompletely, id, remaining};
         }
 
         if (processed.type == OrderType::Limit) {
             const Quantity remaining = processed.remaining;
-            rest(*incomingIndex);
+            rest(incomingIndex);
             return {SubmitStatus::RestingInBook, id, remaining};
         }
 
         // ON HOLD, as requested: keep the unfilled market order outside the book.
         // It is not added to orderIdToIndex_ and will not be re-matched automatically.
         const Quantity remaining = processed.remaining;
-        heldMarketOrderIndices_.push_back(*incomingIndex);
+        heldMarketOrderIndices_.push_back(incomingIndex);
         return {SubmitStatus::MarketRemainderHeld, id, remaining};
     }
 
