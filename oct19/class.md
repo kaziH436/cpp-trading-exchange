@@ -1,75 +1,72 @@
-## Quiz 1
+# Quiz 1
 
-1. std::array and std::vector provides O(1) for random 
-True
+## Containers
+
+1. `std::array` and `std::vector` provide O(1) for random 
+   - **True**
 
 2. Erasing an element from the middle will invalidate all the elements
-False 
+   - **False**
 
-3. Vectors and array will be shifting the elements
+3. Vectors and arrays will be shifting the elements
+   - **Vector:** faster for inserting in the middle (5-10x faster than iterating through the list)
+   - **List:** faster for insertion and deletion
+   - If a pointer points to memory, that memory may not be loaded in the cache.
 
+4. **True.** Inserting at the end of an array is O(n) because it needs to be iterated through to get to the end, but the linked list has a tail pointer.
+   - Array insert can't work in C++ as it's fixed size.
 
-Vector: faster for inserting in the middle (5-10x faster than iterating through the list)
-List: faster for insertion and deletion 
+## Templates
 
-if a pointer points to memory, that memory may not be loaded in the cache. 
+- `template<typename T>`: only works when it's the same dtype and the condition is correct
 
-4. True, inserting an the end of an array is O(n) as it needs to be iterated through to get to the end but the linked list, there is the tail pointer
-- array insert can't work in c++  as its fixed size 
+## E / F
 
-template<typename T>: only works when its same dtype and condition correct 
+- **E:**
+- **F:**
 
-E:
+## Memory pool design choices
 
-F: 
+Difference between the 2 memory pool design choices:
 
-Difference between the 2 memory pool design choices 
-- the 2nd memory pool is implemented using tuple data structure
+- The 2nd memory pool is implemented using a tuple data structure
 - Finding smth
-- using the boolean will be faster since its smaller than the 2nd vector, but the first vector and second vector will be allocated right
+- Using the boolean will be faster since it's smaller than the 2nd vector, but the first vector and second vector will be allocated right
 
+## Hash Maps vs. Trees
 
-std::unordered_map (lookup table)
-- insert, find, erase 
+- `std::unordered_map` (lookup table)
+  - insert, find, erase
+- `std::map` (a tree?)
+  - O(log n) for insert, find, erase
+- Is a std::map stored as an array? No. A heap can live in an array because it’s a complete tree: every level is filled left to right, so a node’s children are found by index math (children of position i sit at 2i+1 and 2i+2). A std::map is a red-black tree where every node is allocated separately and holds pointers to its parent, left child, and right child. The nodes can be scattered anywhere in memory. So it’s not true that every tree is an array, and not everything is consecutive memory. Linked lists, maps, and the node storage of unordered_maps are all pointer-based. Vectors and heaps are the contiguous ones.
 
-std::map (a tree?)
-- O(log n) for insert, find, erase
+**Ask:** Keep hot objects cache-local in a contiguous vector?
 
+---
 
+## Trading Exchange
 
-ask // Keep hot objects cache-local in a contiguous vector​? 
+- Stock exchange, commodities, crypto
 
+### Matching Engine
 
-trading exchange:
-- stock exchange, commidities, cypto
+- Central limit order book: maintains all active buy/sell orders
+- Matches new orders with an existing order or adds it to the order book
 
-Matching matching engine:
-- central limit order book: maintains all active buy/sell orders 
-- matches new orders with an existing order or adds it to an order book
+### Order Book
 
-Order book
-- asks (placing orders to sell)
+- **Asks:** orders to sell
+- **Bids:** orders to buy
 
-- bids (placing orders to buy)
+### Matching Algorithm
 
-Matching algo:
-order info:
-- ticker (e.g. AAPL)
-- price of 1 share of the stock ( or is it based on the total number of shares )
-- size (number of shares) 
-- side (e.g. buy or sell)
-- order types: 
-    - limit order: buy at this price >=
-    - market order buy at whatever price, hence matches with the best ask
-- client Id 
-- order ID 
+Order info:
 
-Order Book transations 
-100.01 -> B
-
-Hw2 : 
-implement <order>
-
-hw1: 
-implement design 2 
-design1; fix the loop using bool
+- **Ticker** (e.g. AAPL)
+- **Price** of 1 share of the stock (or is it based on the total number of shares?)
+- **Size** (number of shares)
+- **Side** (e.g. buy or sell)
+- **Order types:**
+  - **Limit order:** buy at this price `>=`
+  - **Market order:** buy at whatever price,
