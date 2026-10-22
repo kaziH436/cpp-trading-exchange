@@ -14,7 +14,7 @@ using ClientId = std::uint64_t;
 using Price    = std::int64_t;   // integer ticks (e.g. cents) -- avoid floating point for prices for miscalculations
 using Quantity = std::uint32_t;
 
-// "No neighbour" marker for the prev/next links (pool indices).
+// "No neighbour" marker for the prev/next links (pool indices)?
 inline constexpr std::uint32_t kNullIndex = std::numeric_limits<std::uint32_t>::max();
 
 enum class Side : std::uint8_t { Buy, Sell };
@@ -41,7 +41,7 @@ public:
     ClientId  clientId  = 0;
     OrderId   orderId   = 0;
 
-    // Links for the per-price-level doubly linked list 
+    // Links for the per-price-level doubly linked list?
     std::uint32_t prev = kNullIndex;
     std::uint32_t next = kNullIndex;
 
