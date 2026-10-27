@@ -9,6 +9,13 @@
 #include <string>
 #include <string_view>
 
+// make the ticker a string. use delc(type) to make more operator like price < other.price or time < price. 
+// Also if the same price is same, the one that has came new is the winner 
+// not sure if time is requried? 
+// is there any flag for the client to show the match of order?
+// minimum code coverage 80%
+
+
 // Compile with: -std=c++2c (GCC 14+/Clang 18+) or -std=c++23 if your compiler lacks the flag.
 
 using OrderId  = std::uint64_t;
