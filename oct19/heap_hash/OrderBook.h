@@ -1,28 +1,37 @@
 #pragma once
 
-#include "../oct12/mem_pool.h"
+// VERSION 3: heap of prices + hash table from price to level.
+// Each side keeps (a) a binary heap of the distinct prices (std::vector managed with the std
+// heap functions; max heap for buys, min heap for sells) and (b) an unordered_map from price to
+// the head/tail pool indices of that price's doubly linked list of orders.
+//   best price / best order : O(1)  (heap top, then one hash lookup)
+//   remove an emptied best price : O(log L)
+//   order at an existing price : O(1) hash lookup + O(1) append
+//   order at a new price : O(1) check + O(log L) push
+//   cancel that empties a price : O(L) find in the heap + O(L) rebuild (make_heap)
+// L = number of distinct prices on that side.
+
+#include "./oct12/mem_pool.h"
 #include "order.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <map>
-#include <sstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map> // convert to priority queue
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-class OrderBook {
+class OrderBookHeapHash {
 public:
     enum class SubmitStatus {
         RestingInBook,
         FilledCompletely,
         IgnoredWrongTicker,
-        DuplicateActiveOrderId,
         PoolFull,
         MarketRemainderHeld
     };
@@ -33,17 +42,23 @@ public:
         Quantity remaining;
     };
 
-    // One OrderBook manages exactly one ticker.
+    // One OrderBookHeapHash manages exactly one ticker.
     // poolCapacity is fixed for the lifetime of this book.
-    explicit OrderBook(std::string_view ticker, std::size_t poolCapacity)
+    explicit OrderBookHeapHash(std::string_view ticker, std::size_t poolCapacity)
         : ticker_(validatedTicker(ticker)), pool_(poolCapacity) {
         orderIdToIndex_.reserve(poolCapacity);
         heldMarketOrderIndices_.reserve(poolCapacity);
-    };
+        // Every price holds at least one pooled order, so a side never has more
+        // prices than the pool has slots. Reserving once means nothing reallocates or rehashes.
+        buyPrices_.reserve(poolCapacity);
+        sellPrices_.reserve(poolCapacity);
+        buyLevels_.reserve(poolCapacity);
+        sellLevels_.reserve(poolCapacity);
+    }
 
-    OrderBook() = delete;
-    OrderBook(const OrderBook&) = delete;
-    OrderBook& operator=(const OrderBook&) = delete;
+    OrderBookHeapHash() = delete;
+    OrderBookHeapHash(const OrderBookHeapHash&) = delete;
+    OrderBookHeapHash& operator=(const OrderBookHeapHash&) = delete;
 
     const std::string& ticker() const noexcept { return ticker_; }
 
@@ -51,11 +66,20 @@ public:
         return orderIdToIndex_.size();
     }
 
-    // These orders are intentionally kept outside the book while the market-order
-    // remainder policy remains unresolved. They are not resting orders and cannot
-    // be canceled through cancel(), whose lookup contains resting orders only.
     std::size_t heldMarketRemainderCount() const noexcept {
         return heldMarketOrderIndices_.size();
+    }
+
+    // Best resting price on each side, or nullopt when that side is empty.
+    std::optional<Price> bestBid() const {
+        return buyPrices_.empty() ? std::nullopt : std::optional<Price>(buyPrices_.front());
+    }
+    std::optional<Price> bestAsk() const {
+        return sellPrices_.empty() ? std::nullopt : std::optional<Price>(sellPrices_.front());
+    }
+    // Number of distinct price levels on one side.
+    std::size_t priceLevelCount(Side side) const noexcept {
+        return side == Side::Buy ? buyPrices_.size() : sellPrices_.size();
     }
 
     // Main entry point for an incoming order. This invokes matching first, then
@@ -68,18 +92,12 @@ public:
             return {SubmitStatus::IgnoredWrongTicker, id, submittedRemaining};
         }
 
-        // Only active resting IDs are kept in this map. The caller is responsible
-        // for ensuring IDs are globally unique, including after orders complete.
-        if (orderIdToIndex_.contains(id)) {
-            return {SubmitStatus::DuplicateActiveOrderId, id, submittedRemaining};
-        }
+        // The caller is responsible for ensuring order IDs are globally unique.
 
         // New submitted orders should not already be linked into another queue.
         incoming.prev = kNullIndex;
         incoming.next = kNullIndex;
 
-        // Keep the incoming order in the pool while it is being matched, as in
-        // the supplied pseudocode. Capacity must allow a slot for this order.
         const auto incomingIndex = pool_.allocate(std::move(incoming));
         if (incomingIndex == MemPool<Order>::kInvalidIndex) {
             return {SubmitStatus::PoolFull, id, submittedRemaining};
@@ -101,7 +119,6 @@ public:
         }
 
         // ON HOLD, as requested: keep the unfilled market order outside the book.
-        // It is not added to orderIdToIndex_ and will not be re-matched automatically.
         const Quantity remaining = processed.remaining;
         heldMarketOrderIndices_.push_back(incomingIndex);
         return {SubmitStatus::MarketRemainderHeld, id, remaining};
@@ -121,26 +138,14 @@ public:
         const Price price = order.price;
 
         if (side == Side::Buy) {
-            unlinkOrder(buys_, price, index);
+            unlinkOrder(buyPrices_, buyLevels_, BuyCompare{}, price, index);
         } else {
-            unlinkOrder(sells_, price, index);
+            unlinkOrder(sellPrices_, sellLevels_, SellCompare{}, price, index);
         }
 
         orderIdToIndex_.erase(idIt);
         pool_.deallocate(index);
         return true;
-    }
-
-    // Prints both sides best-price-first, with FIFO order within each price level.
-    // Prices are displayed in the integer units used by Order::price.
-    std::string toString() const {
-        std::ostringstream out;
-        out << "OrderBook: " << ticker_ << '\n';
-        out << "BUYS (highest price first)\n";
-        writeSide(out, buys_);
-        out << "SELLS (lowest price first)\n";
-        writeSide(out, sells_);
-        return out.str();
     }
 
 private:
@@ -149,8 +154,10 @@ private:
         std::uint32_t tail = kNullIndex;
     };
 
-    using BuyMap = std::map<Price, PriceLevel, std::greater<Price>>;
-    using SellMap = std::map<Price, PriceLevel, std::less<Price>>;
+    using PriceHeap = std::vector<Price>;
+    using LevelMap = std::unordered_map<Price, PriceLevel>;
+    using BuyCompare = std::less<Price>;      // max heap: highest bid on top
+    using SellCompare = std::greater<Price>;  // min heap: lowest ask on top
 
     static std::string validatedTicker(std::string_view ticker) {
         if (ticker.empty() || ticker.size() >= Order::kTickerCapacity) {
@@ -175,29 +182,34 @@ private:
         while (pool_.get(incomingIndex).remaining > 0) {
             const Side incomingSide = pool_.get(incomingIndex).side;
             const bool traded = (incomingSide == Side::Buy)
-                                    ? matchOne(incomingIndex, sells_)
-                                    : matchOne(incomingIndex, buys_);
+                                    ? matchOne(incomingIndex, sellPrices_, sellLevels_, SellCompare{})
+                                    : matchOne(incomingIndex, buyPrices_, buyLevels_, BuyCompare{});
             if (!traded) {
                 break;
             }
         }
     }
 
-    // Attempts one trade against the best price level on the opposite side.
-    // Returns false if the book is empty on that side or the best price is not eligible.
-    template <typename PriceMap>
-    bool matchOne(std::uint32_t incomingIndex, PriceMap& opposite) {
-        if (opposite.empty()) {
+    // Attempts one trade against the best price (top of the opposite heap).
+    // Returns false if that side is empty or the best price is not eligible.
+    template <typename Compare>
+    bool matchOne(std::uint32_t incomingIndex, PriceHeap& prices, LevelMap& levels, Compare comp) {
+        if (prices.empty()) {
             return false;
         }
 
-        auto bestLevel = opposite.begin();
+        const Price bestPrice = prices.front();
         Order& incoming = pool_.get(incomingIndex);
-        if (!priceAllowsTrade(incoming, bestLevel->first)) {
+        if (!priceAllowsTrade(incoming, bestPrice)) {
             return false;
         }
 
-        const std::uint32_t restingIndex = bestLevel->second.head;
+        const auto levelIt = levels.find(bestPrice);
+        if (levelIt == levels.end()) {
+            throw std::logic_error("Price heap entry has no level");
+        }
+
+        const std::uint32_t restingIndex = levelIt->second.head;
         if (restingIndex == kNullIndex) {
             throw std::logic_error("Price level has no head order");
         }
@@ -212,15 +224,17 @@ private:
         resting.fill(tradedQuantity);
 
         if (resting.isFilled()) {
-            removeFilledHead(opposite, bestLevel, restingIndex);
+            removeFilledHead(prices, levels, comp, levelIt, restingIndex);
         }
         // If the resting order is only partially filled, it remains at the head.
         return true;
     }
 
-    template <typename PriceMap>
-    void removeFilledHead(PriceMap& opposite,
-                          typename PriceMap::iterator levelIt,
+    template <typename Compare>
+    void removeFilledHead(PriceHeap& prices,
+                          LevelMap& levels,
+                          Compare comp,
+                          typename LevelMap::iterator levelIt,
                           std::uint32_t restingIndex) {
         Order& resting = pool_.get(restingIndex);
         const OrderId completedOrderId = resting.orderId;
@@ -235,7 +249,10 @@ private:
         }
 
         if (level.head == kNullIndex) {
-            opposite.erase(levelIt);
+            // The best price is empty: drop its level and pop it off the heap, O(log L).
+            levels.erase(levelIt);
+            std::pop_heap(prices.begin(), prices.end(), comp);
+            prices.pop_back();
         }
 
         orderIdToIndex_.erase(completedOrderId);
@@ -253,9 +270,9 @@ private:
 
         try {
             if (order.side == Side::Buy) {
-                appendToPriceLevel(buys_, orderIndex, order.price);
+                appendToPriceLevel(buyPrices_, buyLevels_, BuyCompare{}, orderIndex, order.price);
             } else {
-                appendToPriceLevel(sells_, orderIndex, order.price);
+                appendToPriceLevel(sellPrices_, sellLevels_, SellCompare{}, orderIndex, order.price);
             }
         } catch (...) {
             orderIdToIndex_.erase(idIt);
@@ -263,33 +280,42 @@ private:
         }
     }
 
-    template <typename PriceMap>
-    void appendToPriceLevel(PriceMap& sideMap,
+    template <typename Compare>
+    void appendToPriceLevel(PriceHeap& prices,
+                            LevelMap& levels,
+                            Compare comp,
                             std::uint32_t orderIndex,
                             Price price) {
-        auto [levelIt, created] = sideMap.try_emplace(price, PriceLevel{});
-        (void)created;
-
         Order& order = pool_.get(orderIndex);
-        PriceLevel& level = levelIt->second;
         order.next = kNullIndex;
-        order.prev = level.tail;
 
-        if (level.tail == kNullIndex) {
-            // First order at this price level.
+        auto [levelIt, created] = levels.try_emplace(price, PriceLevel{});  // O(1) lookup
+        PriceLevel& level = levelIt->second;
+
+        if (created) {
+            // New price: first order in the level, and a new entry sifted into the heap, O(log L).
+            order.prev = kNullIndex;
             level.head = orderIndex;
-        } else {
-            // Connect the previous tail to the new order.
-            pool_.get(level.tail).next = orderIndex;
+            level.tail = orderIndex;
+            prices.push_back(price);
+            std::push_heap(prices.begin(), prices.end(), comp);
+            return;
         }
 
+        // Existing price: append to the tail of its list, O(1).
+        order.prev = level.tail;
+        pool_.get(level.tail).next = orderIndex;
         level.tail = orderIndex;
     }
 
-    template <typename PriceMap>
-    void unlinkOrder(PriceMap& sideMap, Price price, std::uint32_t orderIndex) {
-        auto levelIt = sideMap.find(price);
-        if (levelIt == sideMap.end()) {
+    template <typename Compare>
+    void unlinkOrder(PriceHeap& prices,
+                     LevelMap& levels,
+                     Compare comp,
+                     Price price,
+                     std::uint32_t orderIndex) {
+        const auto levelIt = levels.find(price);
+        if (levelIt == levels.end()) {
             throw std::logic_error("Active order refers to a missing price level");
         }
 
@@ -311,33 +337,25 @@ private:
         }
 
         if (level.head == kNullIndex) {
-            sideMap.erase(levelIt);
-        }
-    }
-
-    template <typename PriceMap>
-    void writeSide(std::ostringstream& out, const PriceMap& sideMap) const {
-        if (sideMap.empty()) {
-            out << "  (empty)\n";
-            return;
-        }
-
-        for (const auto& [price, level] : sideMap) {
-            out << "  Price " << price << ":\n";
-
-            std::uint32_t currentIndex = level.head;
-            while (currentIndex != kNullIndex) {
-                const Order& order = pool_.get(currentIndex);
-                out << "    " << order.toString() << '\n';
-                currentIndex = order.next;
+            // The price is empty and may sit in the middle of the heap: drop its level,
+            // remove it from the heap, then rebuild the heap, O(L). Cancels are rare.
+            levels.erase(levelIt);
+            const auto priceIt = std::find(prices.begin(), prices.end(), price);
+            if (priceIt == prices.end()) {
+                throw std::logic_error("Price level is missing from the price heap");
             }
+            *priceIt = prices.back();
+            prices.pop_back();
+            std::make_heap(prices.begin(), prices.end(), comp);
         }
     }
 
     std::string ticker_;
     MemPool<Order> pool_;
-    BuyMap buys_;
-    SellMap sells_;
+    PriceHeap buyPrices_;
+    PriceHeap sellPrices_;
+    LevelMap buyLevels_;
+    LevelMap sellLevels_;
     std::unordered_map<OrderId, std::uint32_t> orderIdToIndex_;
     std::vector<std::uint32_t> heldMarketOrderIndices_;
 };
