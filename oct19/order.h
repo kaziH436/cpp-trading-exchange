@@ -94,6 +94,19 @@ public:
         return qty;
     }
 
+    // Sets the remaining quantity directly. Used by update() and by self-trade prevention.
+    // size moves with it so filled() stays correct: shares removed or added this way
+    // are NOT counted as filled (they never traded). Throws if size would overflow.
+    void setRemaining(Quantity newRemaining) {
+        const std::uint64_t newSize = std::uint64_t{filled()} + newRemaining;
+        if (newSize > std::numeric_limits<Quantity>::max()) {
+            throw std::invalid_argument(
+                std::format("Order #{}: quantity {} is too large", orderId, newRemaining));
+        }
+        size = static_cast<Quantity>(newSize);
+        remaining = newRemaining;
+    }
+
     std::string toString() const {
         if (type == OrderType::Market) {
             return std::format("Order #{} [client {}] {} {} {} MARKET, remaining {}/{}",

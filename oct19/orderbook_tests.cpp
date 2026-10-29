@@ -1,280 +1,789 @@
-#include "map/OrderBookMap.h"
+// Google Test suite for the heap-only order book (OrderBookHeap in OrderBook.h).
+//
+// Sections:
+//   1. Core behavior (matching, price priority, FIFO, market orders, pool, cancel)
+//   2. update(orderId, newQuantity)
+//   3. disconnect(clientId)
+//   4. Self-trade prevention (decrement-and-cancel)
+//   5. Order::setRemaining
+//   6. Randomized comparison against a deliberately simple reference book
 
-#include <iostream>
+#include "OrderBook.h"
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <optional>
+#include <random>
+#include <set>
+#include <stdexcept>
 #include <string>
-#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace {
 
-int checksRun = 0;
-int checksFailed = 0;
+using Status = OrderBookHeap::SubmitStatus;
+using UpdateStatus = OrderBookHeap::UpdateStatus;
 
-const char* statusName(OrderBook::SubmitStatus status) {
-    switch (status) {
-        case OrderBook::SubmitStatus::RestingInBook:
-            return "RestingInBook";
-        case OrderBook::SubmitStatus::FilledCompletely:
-            return "FilledCompletely";
-        case OrderBook::SubmitStatus::IgnoredWrongTicker:
-            return "IgnoredWrongTicker";
-        case OrderBook::SubmitStatus::DuplicateActiveOrderId:
-            return "DuplicateActiveOrderId";
-        case OrderBook::SubmitStatus::PoolFull:
-            return "PoolFull";
-        case OrderBook::SubmitStatus::MarketRemainderHeld:
-            return "MarketRemainderHeld";
+// Orders default to client 1. Tests that need several clients pass one explicitly.
+Order limit(OrderId id, Side side, Price price, Quantity qty, ClientId client = 1,
+            const char* ticker = "AAPL") {
+    return Order(ticker, qty, side, OrderType::Limit, price, client, id);
+}
+
+Order market(OrderId id, Side side, Quantity qty, ClientId client = 1) {
+    return Order("AAPL", qty, side, OrderType::Market, 0, client, id);
+}
+
+class HeapBookTest : public ::testing::Test {
+protected:
+    OrderBookHeap book{"AAPL", 64};
+};
+
+// =====================================================================================
+// 1. Core behavior
+// =====================================================================================
+
+TEST_F(HeapBookTest, StartsEmpty) {
+    EXPECT_EQ(book.ticker(), "AAPL");
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+    EXPECT_EQ(book.heldMarketRemainderCount(), 0u);
+    EXPECT_FALSE(book.bestBid().has_value());
+    EXPECT_FALSE(book.bestAsk().has_value());
+    EXPECT_EQ(book.priceLevelCount(Side::Buy), 0u);
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 0u);
+}
+
+TEST_F(HeapBookTest, InvalidTickerThrows) {
+    EXPECT_THROW(OrderBookHeap("", 4), std::invalid_argument);
+    EXPECT_THROW(OrderBookHeap("TOOLONGXX", 4), std::invalid_argument);
+}
+
+TEST_F(HeapBookTest, WrongTickerIsIgnored) {
+    const auto result = book.submitOrder(limit(1, Side::Buy, 100, 10, 1, "MSFT"));
+    EXPECT_EQ(result.status, Status::IgnoredWrongTicker);
+    EXPECT_EQ(result.orderId, 1u);
+    EXPECT_EQ(result.remaining, 10u);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, OrdersRestWhenNothingToMatch) {
+    EXPECT_EQ(book.submitOrder(limit(1, Side::Buy, 99, 10)).status, Status::RestingInBook);
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Sell, 101, 7)).status, Status::RestingInBook);
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(99));
+    EXPECT_EQ(book.bestAsk(), std::optional<Price>(101));
+    EXPECT_EQ(book.restingOrderCount(), 2u);
+}
+
+TEST_F(HeapBookTest, ExactMatchFillsBothOrders) {
+    book.submitOrder(limit(1, Side::Sell, 100, 10, 1));
+    const auto result = book.submitOrder(limit(2, Side::Buy, 100, 10, 2));
+    EXPECT_EQ(result.status, Status::FilledCompletely);
+    EXPECT_EQ(result.remaining, 0u);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 0u);
+}
+
+TEST_F(HeapBookTest, ExactMatchSellIncoming) {
+    book.submitOrder(limit(1, Side::Buy, 100, 10, 1));
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Sell, 100, 10, 2)).status, Status::FilledCompletely);
+    EXPECT_FALSE(book.bestBid().has_value());
+}
+
+TEST_F(HeapBookTest, IncomingLargerThanRestingRestsRemainder) {
+    book.submitOrder(limit(1, Side::Sell, 100, 4, 1));
+    const auto result = book.submitOrder(limit(2, Side::Buy, 100, 10, 2));
+    EXPECT_EQ(result.status, Status::RestingInBook);
+    EXPECT_EQ(result.remaining, 6u);
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(100));
+    EXPECT_FALSE(book.bestAsk().has_value());
+}
+
+TEST_F(HeapBookTest, IncomingSmallerThanRestingLeavesRestingPartiallyFilled) {
+    book.submitOrder(limit(1, Side::Sell, 100, 10, 1));
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Buy, 100, 3, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.bestAsk(), std::optional<Price>(100));
+    EXPECT_TRUE(book.cancel(1));
+}
+
+TEST_F(HeapBookTest, BuyTakesTheLowestAskFirst) {
+    book.submitOrder(limit(1, Side::Sell, 102, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(3, Side::Sell, 101, 5, 1));
+    EXPECT_EQ(book.submitOrder(limit(4, Side::Buy, 102, 5, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.bestAsk(), std::optional<Price>(101));
+    EXPECT_FALSE(book.cancel(2));  // the 100 ask was filled first
+}
+
+TEST_F(HeapBookTest, SellTakesTheHighestBidFirst) {
+    book.submitOrder(limit(1, Side::Buy, 98, 5, 1));
+    book.submitOrder(limit(2, Side::Buy, 100, 5, 1));
+    book.submitOrder(limit(3, Side::Buy, 99, 5, 1));
+    EXPECT_EQ(book.submitOrder(limit(4, Side::Sell, 98, 5, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(99));
+    EXPECT_FALSE(book.cancel(2));
+}
+
+TEST_F(HeapBookTest, SamePriceIsFirstInFirstOut) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(3, Side::Sell, 100, 5, 1));
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 1u);
+    book.submitOrder(limit(4, Side::Buy, 100, 5, 2));
+    EXPECT_FALSE(book.cancel(1));
+    book.submitOrder(limit(5, Side::Buy, 100, 5, 2));
+    EXPECT_FALSE(book.cancel(2));
+    EXPECT_TRUE(book.cancel(3));
+}
+
+TEST_F(HeapBookTest, LargeOrderSweepsSeveralPriceLevels) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 101, 5, 1));
+    book.submitOrder(limit(3, Side::Sell, 102, 5, 1));
+    const auto result = book.submitOrder(limit(4, Side::Buy, 101, 12, 2));
+    EXPECT_EQ(result.status, Status::RestingInBook);
+    EXPECT_EQ(result.remaining, 2u);  // 100 and 101 consumed, 102 is above the limit
+    EXPECT_EQ(book.bestAsk(), std::optional<Price>(102));
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(101));
+}
+
+TEST_F(HeapBookTest, MarketOrdersFillAndHoldRemainder) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 101, 5, 1));
+    EXPECT_EQ(book.submitOrder(market(3, Side::Buy, 8, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.bestAsk(), std::optional<Price>(101));
+
+    const auto held = book.submitOrder(market(4, Side::Buy, 10, 2));
+    EXPECT_EQ(held.status, Status::MarketRemainderHeld);
+    EXPECT_EQ(held.remaining, 8u);  // only 2 shares were left to take
+    EXPECT_EQ(book.heldMarketRemainderCount(), 1u);
+    EXPECT_FALSE(book.cancel(4));  // held orders are not cancelable
+}
+
+TEST_F(HeapBookTest, MarketSellFillsAgainstBids) {
+    book.submitOrder(limit(1, Side::Buy, 100, 5, 1));
+    EXPECT_EQ(book.submitOrder(market(2, Side::Sell, 5, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, PoolFullIsReportedAndSlotsAreReused) {
+    OrderBookHeap small("AAPL", 2);
+    EXPECT_EQ(small.submitOrder(limit(1, Side::Buy, 90, 1)).status, Status::RestingInBook);
+    EXPECT_EQ(small.submitOrder(limit(2, Side::Buy, 91, 1)).status, Status::RestingInBook);
+    const auto result = small.submitOrder(limit(3, Side::Buy, 92, 1));
+    EXPECT_EQ(result.status, Status::PoolFull);
+    EXPECT_EQ(result.remaining, 1u);
+    EXPECT_TRUE(small.cancel(1));
+    EXPECT_EQ(small.submitOrder(limit(4, Side::Buy, 93, 1)).status, Status::RestingInBook);
+}
+
+TEST_F(HeapBookTest, SlotsAreReusedAfterFills) {
+    OrderBookHeap small("AAPL", 3);
+    OrderId id = 1;
+    for (int round = 0; round < 50; ++round) {
+        EXPECT_EQ(small.submitOrder(limit(id++, Side::Sell, 100, 2, 1)).status, Status::RestingInBook);
+        EXPECT_EQ(small.submitOrder(limit(id++, Side::Buy, 100, 2, 2)).status, Status::FilledCompletely);
+    }
+    EXPECT_EQ(small.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, CancelUnknownIdReturnsFalse) {
+    EXPECT_FALSE(book.cancel(12345));
+}
+
+TEST_F(HeapBookTest, CancelOnlyOrderRemovesItsPrice) {
+    book.submitOrder(limit(1, Side::Buy, 100, 5));
+    EXPECT_TRUE(book.cancel(1));
+    EXPECT_FALSE(book.cancel(1));
+    EXPECT_EQ(book.priceLevelCount(Side::Buy), 0u);
+    EXPECT_FALSE(book.bestBid().has_value());
+}
+
+TEST_F(HeapBookTest, CancelHeadMiddleAndTailOfOneLevel) {
+    for (OrderId id = 1; id <= 4; ++id) {
+        book.submitOrder(limit(id, Side::Sell, 100, 5, 1));
+    }
+    EXPECT_TRUE(book.cancel(2));  // middle
+    EXPECT_TRUE(book.cancel(4));  // tail
+    EXPECT_TRUE(book.cancel(1));  // head
+    EXPECT_EQ(book.restingOrderCount(), 1u);
+    EXPECT_EQ(book.submitOrder(limit(5, Side::Buy, 100, 5, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, CancelingAPriceInTheMiddleOfTheHeapKeepsBestPriceCorrect) {
+    for (OrderId id = 1; id <= 10; ++id) {
+        book.submitOrder(limit(id, Side::Sell, 100 + static_cast<Price>(id), 1, 1));
+    }
+    EXPECT_TRUE(book.cancel(5));
+    EXPECT_TRUE(book.cancel(9));
+    EXPECT_TRUE(book.cancel(3));
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 7u);
+    const std::vector<Price> expected{101, 102, 104, 106, 107, 108, 110};
+    for (Price p : expected) {
+        EXPECT_EQ(book.bestAsk(), std::optional<Price>(p));
+        EXPECT_EQ(book.submitOrder(market(1000 + static_cast<OrderId>(p), Side::Buy, 1, 2)).status,
+                  Status::FilledCompletely);
+    }
+    EXPECT_FALSE(book.bestAsk().has_value());
+}
+
+TEST_F(HeapBookTest, CancelingBidPricesKeepsMaxOrder) {
+    for (OrderId id = 1; id <= 8; ++id) {
+        book.submitOrder(limit(id, Side::Buy, 100 - static_cast<Price>(id), 1, 1));
+    }
+    EXPECT_TRUE(book.cancel(1));  // best bid 99 removed from the top
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(98));
+    EXPECT_TRUE(book.cancel(4));
+    EXPECT_TRUE(book.cancel(8));
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(98));
+    EXPECT_EQ(book.priceLevelCount(Side::Buy), 5u);
+}
+
+// =====================================================================================
+// 2. update(orderId, newQuantity)
+// =====================================================================================
+
+// Helper: rests orders 1..n (client 1) at one sell price, oldest first, each with `qty` shares.
+void restSells(OrderBookHeap& b, OrderId n, Quantity qty, Price price = 100) {
+    for (OrderId id = 1; id <= n; ++id) {
+        b.submitOrder(limit(id, Side::Sell, price, qty, 1));
+    }
+}
+
+// Helper: a buyer from another client takes exactly one order's worth of shares at 100.
+// Returns which of orders 1..candidates was at the front of the queue, i.e. the one that
+// is gone afterwards. It cancels the others to find out, so use it as the last step of a test.
+OrderId whoWasFirst(OrderBookHeap& b, OrderId candidates, OrderId buyId, Quantity qty) {
+    EXPECT_EQ(b.submitOrder(limit(buyId, Side::Buy, 100, qty, 2)).status, Status::FilledCompletely);
+    OrderId gone = 0;
+    int goneCount = 0;
+    for (OrderId id = 1; id <= candidates; ++id) {
+        if (!b.cancel(id)) {
+            gone = id;
+            ++goneCount;
+        }
+    }
+    EXPECT_EQ(goneCount, 1);
+    return gone;
+}
+
+TEST_F(HeapBookTest, UpdateRejectsZeroAndUnknownOrders) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5));
+    EXPECT_EQ(book.update(1, 0), UpdateStatus::InvalidQuantity);
+    EXPECT_EQ(book.update(99, 5), UpdateStatus::NotFound);
+    // The rejected zero update left the order untouched.
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Buy, 100, 5, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+    // Filled orders are no longer resting.
+    EXPECT_EQ(book.update(1, 5), UpdateStatus::NotFound);
+}
+
+TEST_F(HeapBookTest, UpdateOnAHeldMarketOrderIsNotFound) {
+    EXPECT_EQ(book.submitOrder(market(1, Side::Buy, 5)).status, Status::MarketRemainderHeld);
+    EXPECT_EQ(book.update(1, 3), UpdateStatus::NotFound);
+}
+
+TEST_F(HeapBookTest, UpdateToSameQuantityChangesNothing) {
+    restSells(book, 2, 5);  // queue: 1, 2
+    EXPECT_EQ(book.update(1, 5), UpdateStatus::Updated);
+    // Order 1 kept the front of the line, so it fills first.
+    EXPECT_EQ(whoWasFirst(book, 2, 10, 5), 1u);
+}
+
+TEST_F(HeapBookTest, DownsizeKeepsQueuePriority) {
+    restSells(book, 2, 10);  // queue: A=1 (10), B=2 (10)
+    EXPECT_EQ(book.update(1, 3), UpdateStatus::Updated);
+    // A now has 3 shares and is still first: a buy of 3 fills A completely.
+    EXPECT_EQ(whoWasFirst(book, 2, 10, 3), 1u);
+}
+
+TEST_F(HeapBookTest, DownsizeReducesTheQuantityThatCanTrade) {
+    book.submitOrder(limit(1, Side::Sell, 100, 10, 1));
+    EXPECT_EQ(book.update(1, 2), UpdateStatus::Updated);
+    const auto result = book.submitOrder(limit(2, Side::Buy, 100, 5, 2));
+    EXPECT_EQ(result.status, Status::RestingInBook);
+    EXPECT_EQ(result.remaining, 3u);  // only 2 shares were available
+}
+
+TEST_F(HeapBookTest, UpsizeMovesTheOrderToTheBackOfTheQueue) {
+    restSells(book, 3, 5);  // queue: 1, 2, 3
+    EXPECT_EQ(book.update(1, 8), UpdateStatus::Updated);  // order 1 was at the front
+    // New queue: 2, 3, 1. Order 2 trades first, then 3, then 1.
+    EXPECT_EQ(whoWasFirst(book, 3, 10, 5), 2u);
+}
+
+TEST_F(HeapBookTest, UpsizeOfAMiddleOrderGoesBehindTheOnesAfterIt) {
+    // Queue 1 2 3 4: up-sizing 2 must give 1 3 4 2, not 1 4 3 2 (which a swap would give).
+    restSells(book, 4, 5);
+    EXPECT_EQ(book.update(2, 9), UpdateStatus::Updated);
+    EXPECT_EQ(book.submitOrder(limit(10, Side::Buy, 100, 5, 2)).status, Status::FilledCompletely);  // 1
+    EXPECT_FALSE(book.cancel(1));
+    EXPECT_EQ(book.submitOrder(limit(11, Side::Buy, 100, 5, 2)).status, Status::FilledCompletely);  // 3
+    EXPECT_FALSE(book.cancel(3));
+    EXPECT_EQ(book.submitOrder(limit(12, Side::Buy, 100, 5, 2)).status, Status::FilledCompletely);  // 4
+    EXPECT_FALSE(book.cancel(4));
+    // Order 2 is last and now holds 9 shares.
+    EXPECT_EQ(book.submitOrder(limit(13, Side::Buy, 100, 9, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, UpsizeOfTheLastOrderAndOfTheOnlyOrderKeepsThem) {
+    restSells(book, 3, 5);
+    EXPECT_EQ(book.update(3, 7), UpdateStatus::Updated);  // already last
+    EXPECT_EQ(whoWasFirst(book, 3, 10, 5), 1u);
+
+    OrderBookHeap other("AAPL", 8);
+    other.submitOrder(limit(1, Side::Buy, 100, 5, 1));
+    EXPECT_EQ(other.update(1, 9), UpdateStatus::Updated);  // the only order at its price
+    EXPECT_EQ(other.submitOrder(limit(2, Side::Sell, 100, 9, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(other.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, UpsizeWorksOnTheBuySideToo) {
+    book.submitOrder(limit(1, Side::Buy, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Buy, 100, 5, 1));
+    EXPECT_EQ(book.update(1, 6), UpdateStatus::Updated);  // queue becomes 2, 1
+    EXPECT_EQ(book.submitOrder(limit(3, Side::Sell, 100, 5, 2)).status, Status::FilledCompletely);
+    EXPECT_FALSE(book.cancel(2));
+    EXPECT_TRUE(book.cancel(1));
+}
+
+TEST_F(HeapBookTest, UpdateAfterAPartialFillSetsTheRemainingQuantity) {
+    book.submitOrder(limit(1, Side::Sell, 100, 10, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 10, 1));
+    book.submitOrder(limit(3, Side::Buy, 100, 4, 2));  // order 1 now has 6 left
+    EXPECT_EQ(book.update(1, 9), UpdateStatus::Updated);  // up-size: goes behind order 2
+    EXPECT_EQ(book.submitOrder(limit(4, Side::Buy, 100, 10, 2)).status, Status::FilledCompletely);
+    EXPECT_FALSE(book.cancel(2));
+    EXPECT_EQ(book.submitOrder(limit(5, Side::Buy, 100, 9, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, UpsizeLeavesOtherPricesAndTheHeapAlone) {
+    book.submitOrder(limit(1, Side::Sell, 103, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 101, 5, 1));
+    book.submitOrder(limit(3, Side::Sell, 101, 5, 1));
+    book.submitOrder(limit(4, Side::Sell, 105, 5, 1));
+    EXPECT_EQ(book.update(2, 8), UpdateStatus::Updated);
+    EXPECT_EQ(book.bestAsk(), std::optional<Price>(101));
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 3u);
+}
+
+TEST_F(HeapBookTest, UpdateTooLargeThrowsAndLeavesTheOrderAlone) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(3, Side::Buy, 100, 2, 2));  // order 1 is partially filled: 3 left
+    // filled (2) + 4,294,967,295 does not fit in 32 bits.
+    EXPECT_THROW(book.update(1, std::numeric_limits<Quantity>::max()), std::invalid_argument);
+    EXPECT_EQ(book.restingOrderCount(), 2u);
+    // Order 1 still has its place and its 3 shares.
+    EXPECT_EQ(book.submitOrder(limit(4, Side::Buy, 100, 3, 2)).status, Status::FilledCompletely);
+    EXPECT_FALSE(book.cancel(1));
+}
+
+// =====================================================================================
+// 3. disconnect(clientId)
+// =====================================================================================
+
+TEST_F(HeapBookTest, DisconnectOfAClientWithNoOrdersDoesNothing) {
+    book.submitOrder(limit(1, Side::Buy, 99, 5, 1));
+    EXPECT_EQ(book.disconnect(7), 0u);
+    EXPECT_EQ(book.restingOrderCount(), 1u);
+}
+
+TEST_F(HeapBookTest, DisconnectCancelsAllOfTheClientsRestingOrdersOnBothSides) {
+    book.submitOrder(limit(1, Side::Buy, 98, 5, 1));
+    book.submitOrder(limit(2, Side::Buy, 99, 5, 2));
+    book.submitOrder(limit(3, Side::Buy, 99, 5, 1));
+    book.submitOrder(limit(4, Side::Sell, 101, 5, 1));
+    book.submitOrder(limit(5, Side::Sell, 102, 5, 2));
+    EXPECT_EQ(book.disconnect(1), 3u);
+    EXPECT_EQ(book.restingOrderCount(), 2u);
+    EXPECT_FALSE(book.cancel(1));
+    EXPECT_FALSE(book.cancel(3));
+    EXPECT_FALSE(book.cancel(4));
+    EXPECT_TRUE(book.cancel(2));
+    EXPECT_TRUE(book.cancel(5));
+}
+
+TEST_F(HeapBookTest, DisconnectRemovesEmptiedPricesAndKeepsTheHeapValid) {
+    // Client 1 owns prices 101, 103, 105 (middle of the heap); client 2 owns 102, 104, 106.
+    for (Price p = 101; p <= 106; ++p) {
+        book.submitOrder(limit(static_cast<OrderId>(p), Side::Sell, p, 1, (p % 2) ? 1 : 2));
+    }
+    EXPECT_EQ(book.disconnect(1), 3u);
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 3u);
+    for (Price p : {102, 104, 106}) {
+        EXPECT_EQ(book.bestAsk(), std::optional<Price>(p));
+        EXPECT_EQ(book.submitOrder(market(1000 + static_cast<OrderId>(p), Side::Buy, 1, 3)).status,
+                  Status::FilledCompletely);
+    }
+    EXPECT_FALSE(book.bestAsk().has_value());
+}
+
+TEST_F(HeapBookTest, DisconnectKeepsTheQueueOrderOfTheOthers) {
+    // One price, queue: 1 (client 1), 2 (client 2), 3 (client 1), 4 (client 2).
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 2));
+    book.submitOrder(limit(3, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(4, Side::Sell, 100, 5, 2));
+    EXPECT_EQ(book.disconnect(1), 2u);
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 1u);
+    EXPECT_EQ(book.submitOrder(limit(10, Side::Buy, 100, 5, 3)).status, Status::FilledCompletely);
+    EXPECT_FALSE(book.cancel(2));  // 2 was first and traded
+    EXPECT_TRUE(book.cancel(4));
+}
+
+TEST_F(HeapBookTest, DisconnectFreesHeldMarketOrdersAndTheirPoolSlots) {
+    OrderBookHeap small("AAPL", 2);
+    EXPECT_EQ(small.submitOrder(market(1, Side::Buy, 5, 1)).status, Status::MarketRemainderHeld);
+    EXPECT_EQ(small.submitOrder(market(2, Side::Buy, 5, 2)).status, Status::MarketRemainderHeld);
+    EXPECT_EQ(small.submitOrder(limit(3, Side::Buy, 90, 1, 3)).status, Status::PoolFull);
+
+    EXPECT_EQ(small.disconnect(1), 1u);
+    EXPECT_EQ(small.heldMarketRemainderCount(), 1u);  // client 2's held order stays
+    // The freed slot can be used again.
+    EXPECT_EQ(small.submitOrder(limit(4, Side::Buy, 90, 1, 3)).status, Status::RestingInBook);
+}
+
+TEST_F(HeapBookTest, ADisconnectedClientMayStillSubmitNewOrders) {
+    book.submitOrder(limit(1, Side::Buy, 99, 5, 1));
+    EXPECT_EQ(book.disconnect(1), 1u);
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Buy, 99, 5, 1)).status, Status::RestingInBook);
+    EXPECT_EQ(book.restingOrderCount(), 1u);
+}
+
+// =====================================================================================
+// 4. Self-trade prevention (decrement-and-cancel)
+// =====================================================================================
+
+TEST_F(HeapBookTest, SmallerIncomingOrderIsRemovedAndTheRestingOrderKeepsTheRest) {
+    // Client 1: resting sell 10, then a buy of 4. Nothing trades: the buy disappears
+    // and the sell keeps 6, still in its original spot.
+    book.submitOrder(limit(1, Side::Sell, 100, 10, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 2));  // client 2 is behind client 1
+    const auto result = book.submitOrder(limit(3, Side::Buy, 100, 4, 1));
+    EXPECT_EQ(result.status, Status::CanceledBySelfTrade);
+    EXPECT_EQ(result.remaining, 0u);
+    EXPECT_EQ(book.restingOrderCount(), 2u);
+    EXPECT_FALSE(book.bestBid().has_value());  // the buy did not rest
+
+    // The sell kept 6 shares and the front spot: client 3 buying 8 takes 6 from client 1,
+    // then 2 from client 2.
+    EXPECT_EQ(book.submitOrder(limit(4, Side::Buy, 100, 8, 3)).status, Status::FilledCompletely);
+    EXPECT_FALSE(book.cancel(1));
+    EXPECT_TRUE(book.cancel(2));  // client 2 still has 3 left
+}
+
+TEST_F(HeapBookTest, LargerIncomingOrderKeepsItsRemainderAndMatchesTheNextOrder) {
+    // Client 1: resting sell 4. Client 2: resting sell 5 behind it. Client 1 buys 10.
+    // 4 is removed from both of client 1's orders, then the remaining 6 trades with
+    // client 2 (5 shares), and the last 1 rests as a bid.
+    book.submitOrder(limit(1, Side::Sell, 100, 4, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 2));
+    const auto result = book.submitOrder(limit(3, Side::Buy, 100, 10, 1));
+    EXPECT_EQ(result.status, Status::RestingInBook);
+    EXPECT_EQ(result.remaining, 1u);
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(100));
+    EXPECT_FALSE(book.bestAsk().has_value());
+    EXPECT_EQ(book.restingOrderCount(), 1u);
+}
+
+TEST_F(HeapBookTest, EqualQuantitiesRemoveBothOrders) {
+    book.submitOrder(limit(1, Side::Sell, 100, 6, 1));
+    const auto result = book.submitOrder(limit(2, Side::Buy, 100, 6, 1));
+    EXPECT_EQ(result.status, Status::CanceledBySelfTrade);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+    EXPECT_EQ(book.priceLevelCount(Side::Sell), 0u);
+}
+
+TEST_F(HeapBookTest, SelfTradePreventionWorksFromTheSellSideToo) {
+    book.submitOrder(limit(1, Side::Buy, 100, 10, 1));
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Sell, 100, 4, 1)).status, Status::CanceledBySelfTrade);
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(100));
+    EXPECT_EQ(book.submitOrder(limit(3, Side::Sell, 100, 6, 2)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, IncomingOrderDoesNotSkipItsOwnOrderToReachSomeoneBehindIt) {
+    // Queue at 100: client 1 sell 5 (front), client 2 sell 5 (behind).
+    // Client 1 buys 3. Price-time priority: the buy meets client 1's own order first.
+    // It must not jump to client 2.
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 2));
+    EXPECT_EQ(book.submitOrder(limit(3, Side::Buy, 100, 3, 1)).status, Status::CanceledBySelfTrade);
+    // Client 2 was untouched: it still has all 5 shares, behind client 1's remaining 2.
+    EXPECT_EQ(book.submitOrder(limit(4, Side::Buy, 100, 7, 3)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, SelfTradeRemovalThenTradeWithAnotherClient) {
+    // Queue at 100: client 1 sell 5, client 2 sell 5. Client 1 buys 8:
+    // 5 are removed from both of client 1's orders, then 3 trade with client 2.
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    book.submitOrder(limit(2, Side::Sell, 100, 5, 2));
+    const auto result = book.submitOrder(limit(3, Side::Buy, 100, 8, 1));
+    EXPECT_EQ(result.status, Status::CanceledBySelfTrade);  // part of it was removed, none is left
+    EXPECT_EQ(result.remaining, 0u);
+    EXPECT_EQ(book.restingOrderCount(), 1u);  // client 2 has 2 left
+    EXPECT_EQ(book.submitOrder(limit(4, Side::Buy, 100, 2, 3)).status, Status::FilledCompletely);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, SelfTradePreventionInTheMiddleOfASweepAcrossPrices) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 2));
+    book.submitOrder(limit(2, Side::Sell, 101, 6, 1));  // client 1's own order
+    book.submitOrder(limit(3, Side::Sell, 102, 5, 3));
+    // Client 1 buys 20 up to 105: trade 5 at 100, remove 6 at 101, trade 5 at 102, rest 4.
+    const auto result = book.submitOrder(limit(4, Side::Buy, 105, 20, 1));
+    EXPECT_EQ(result.status, Status::RestingInBook);
+    EXPECT_EQ(result.remaining, 4u);
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(105));
+    EXPECT_FALSE(book.bestAsk().has_value());
+}
+
+TEST_F(HeapBookTest, OrdersFromTheSameClientAtNonCrossingPricesBothRest) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Buy, 99, 5, 1)).status, Status::RestingInBook);
+    EXPECT_EQ(book.bestBid(), std::optional<Price>(99));
+    EXPECT_EQ(book.bestAsk(), std::optional<Price>(100));
+}
+
+TEST_F(HeapBookTest, SelfTradePreventionAppliesToMarketOrders) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    EXPECT_EQ(book.submitOrder(market(2, Side::Buy, 3, 1)).status, Status::CanceledBySelfTrade);
+
+    // 2 shares are left of client 1's sell. A market buy of 5 removes those 2 and the
+    // last 3 shares have nothing to trade with, so they are held.
+    const auto held = book.submitOrder(market(3, Side::Buy, 5, 1));
+    EXPECT_EQ(held.status, Status::MarketRemainderHeld);
+    EXPECT_EQ(held.remaining, 3u);
+    EXPECT_EQ(book.heldMarketRemainderCount(), 1u);
+    EXPECT_EQ(book.restingOrderCount(), 0u);
+}
+
+TEST_F(HeapBookTest, DifferentClientsStillTrade) {
+    book.submitOrder(limit(1, Side::Sell, 100, 5, 1));
+    EXPECT_EQ(book.submitOrder(limit(2, Side::Buy, 100, 5, 2)).status, Status::FilledCompletely);
+}
+
+TEST_F(HeapBookTest, SelfTradeRemovalIsNotCountedAsAFill) {
+    // The remaining 6 shares of client 1's sell are still real and tradeable.
+    book.submitOrder(limit(1, Side::Sell, 100, 10, 1));
+    book.submitOrder(limit(2, Side::Buy, 100, 4, 1));  // removes 4 from both
+    const auto result = book.submitOrder(limit(3, Side::Buy, 100, 9, 2));
+    EXPECT_EQ(result.status, Status::RestingInBook);
+    EXPECT_EQ(result.remaining, 3u);  // 6 traded, 3 left over
+}
+
+// =====================================================================================
+// 5. Order::setRemaining
+// =====================================================================================
+
+TEST(OrderSetRemaining, KeepsFilledCorrect) {
+    Order order("AAPL", 10, Side::Buy, OrderType::Limit, 100, 1, 1);
+    order.fill(4);  // filled 4, remaining 6
+    order.setRemaining(2);
+    EXPECT_EQ(order.remaining, 2u);
+    EXPECT_EQ(order.size, 6u);
+    EXPECT_EQ(order.filled(), 4u);
+    order.setRemaining(9);
+    EXPECT_EQ(order.size, 13u);
+    EXPECT_EQ(order.filled(), 4u);
+    order.setRemaining(0);
+    EXPECT_TRUE(order.isFilled());
+    EXPECT_THROW(order.setRemaining(std::numeric_limits<Quantity>::max()), std::invalid_argument);
+}
+
+// =====================================================================================
+// 6. Randomized comparison against a simple reference book
+// =====================================================================================
+// The reference book keeps every resting order in a plain list and, for every match,
+// searches the whole list for the best price, breaking ties by arrival sequence. It is slow
+// but easy to trust. The heap book must give the same answer to every operation.
+
+class ReferenceBook {
+public:
+    struct Resting {
+        OrderId id;
+        ClientId client;
+        Side side;
+        Price price;
+        Quantity remaining;
+        std::uint64_t sequence;  // lower = earlier in line
+    };
+
+    std::pair<Status, Quantity> submit(OrderId id, ClientId client, Side side, OrderType type,
+                                       Price price, Quantity quantity) {
+        Quantity remaining = quantity;
+        Quantity selfTradeCanceled = 0;
+        std::vector<Resting>& opposite = (side == Side::Buy) ? sells_ : buys_;
+
+        while (remaining > 0) {
+            const auto best = bestOf(opposite);
+            if (best == opposite.end()) break;
+            const bool priceOk = type == OrderType::Market ||
+                                 (side == Side::Buy ? best->price <= price : best->price >= price);
+            if (!priceOk) break;
+
+            const Quantity amount = std::min(remaining, best->remaining);
+            remaining -= amount;
+            best->remaining -= amount;
+            if (best->client == client) {
+                selfTradeCanceled += amount;  // removed from both, no trade
+            }
+            if (best->remaining == 0) {
+                opposite.erase(best);
+            }
+        }
+
+        if (remaining == 0) {
+            return {selfTradeCanceled > 0 ? Status::CanceledBySelfTrade : Status::FilledCompletely, 0};
+        }
+        if (type == OrderType::Limit) {
+            (side == Side::Buy ? buys_ : sells_)
+                .push_back(Resting{id, client, side, price, remaining, ++sequence_});
+            return {Status::RestingInBook, remaining};
+        }
+        held_.push_back({id, client});
+        return {Status::MarketRemainderHeld, remaining};
     }
 
-    return "UnknownStatus";
-}
+    bool cancel(OrderId id) {
+        return eraseById(buys_, id) || eraseById(sells_, id);
+    }
 
-void check(bool condition, const std::string& description) {
-    ++checksRun;
-    if (condition) {
-        std::cout << "  [PASS] " << description << '\n';
-    } else {
-        ++checksFailed;
-        std::cout << "  [FAIL] " << description << '\n';
+    UpdateStatus update(OrderId id, Quantity newQuantity) {
+        if (newQuantity == 0) return UpdateStatus::InvalidQuantity;
+        for (std::vector<Resting>* side : {&buys_, &sells_}) {
+            for (Resting& r : *side) {
+                if (r.id != id) continue;
+                if (newQuantity > r.remaining) r.sequence = ++sequence_;  // back of the line
+                r.remaining = newQuantity;
+                return UpdateStatus::Updated;
+            }
+        }
+        return UpdateStatus::NotFound;
+    }
+
+    std::size_t disconnect(ClientId client) {
+        std::size_t removed = 0;
+        for (std::vector<Resting>* side : {&buys_, &sells_}) {
+            const auto before = side->size();
+            side->erase(std::remove_if(side->begin(), side->end(),
+                                       [&](const Resting& r) { return r.client == client; }),
+                        side->end());
+            removed += before - side->size();
+        }
+        const auto heldBefore = held_.size();
+        held_.erase(std::remove_if(held_.begin(), held_.end(),
+                                   [&](const auto& h) { return h.second == client; }),
+                    held_.end());
+        return removed + (heldBefore - held_.size());
+    }
+
+    std::size_t restingCount() const { return buys_.size() + sells_.size(); }
+    std::size_t heldCount() const { return held_.size(); }
+    std::optional<Price> bestBid() const {
+        if (buys_.empty()) return std::nullopt;
+        Price best = buys_.front().price;
+        for (const Resting& r : buys_) best = std::max(best, r.price);
+        return best;
+    }
+    std::optional<Price> bestAsk() const {
+        if (sells_.empty()) return std::nullopt;
+        Price best = sells_.front().price;
+        for (const Resting& r : sells_) best = std::min(best, r.price);
+        return best;
+    }
+    std::size_t levelCount(Side side) const {
+        std::set<Price> prices;
+        for (const Resting& r : (side == Side::Buy ? buys_ : sells_)) prices.insert(r.price);
+        return prices.size();
+    }
+
+private:
+    // Best order of one side: best price first (highest for buys, lowest for sells), then the
+    // earliest sequence. The side is found from the orders themselves.
+    static std::vector<Resting>::iterator bestOf(std::vector<Resting>& orders) {
+        auto best = orders.end();
+        for (auto it = orders.begin(); it != orders.end(); ++it) {
+            if (best == orders.end()) {
+                best = it;
+                continue;
+            }
+            const bool betterPrice = (it->side == Side::Buy) ? it->price > best->price
+                                                             : it->price < best->price;
+            if (betterPrice || (it->price == best->price && it->sequence < best->sequence)) {
+                best = it;
+            }
+        }
+        return best;
+    }
+
+    static bool eraseById(std::vector<Resting>& orders, OrderId id) {
+        const auto it = std::find_if(orders.begin(), orders.end(),
+                                     [id](const Resting& r) { return r.id == id; });
+        if (it == orders.end()) return false;
+        orders.erase(it);
+        return true;
+    }
+
+    std::vector<Resting> buys_;
+    std::vector<Resting> sells_;
+    std::vector<std::pair<OrderId, ClientId>> held_;
+    std::uint64_t sequence_ = 0;
+};
+
+TEST(HeapBookRandomized, MatchesTheReferenceBookOnEveryOperation) {
+    OrderBookHeap book("AAPL", 50000);
+    ReferenceBook reference;
+    std::mt19937_64 rng(424242);
+    OrderId nextId = 1;
+
+    for (int step = 0; step < 30000; ++step) {
+        const auto roll = rng() % 100;
+        if (nextId > 1 && roll < 8) {  // cancel
+            const OrderId id = 1 + rng() % (nextId - 1);
+            ASSERT_EQ(book.cancel(id), reference.cancel(id)) << "step " << step;
+        } else if (nextId > 1 && roll < 25) {  // update (0 is included on purpose)
+            const OrderId id = 1 + rng() % (nextId - 1);
+            const Quantity quantity = static_cast<Quantity>(rng() % 40);
+            ASSERT_EQ(book.update(id, quantity), reference.update(id, quantity)) << "step " << step;
+        } else if (roll < 28) {  // disconnect
+            const ClientId client = 1 + rng() % 4;
+            ASSERT_EQ(book.disconnect(client), reference.disconnect(client)) << "step " << step;
+        } else {  // submit: few clients and a narrow price range, so self-trades are common
+            const OrderId id = nextId++;
+            const ClientId client = 1 + rng() % 4;
+            const Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+            const Quantity quantity = static_cast<Quantity>(1 + rng() % 30);
+            const bool isMarket = (rng() % 25) == 0;
+            const Price price = static_cast<Price>(95 + rng() % 11);
+            const Order order = isMarket ? market(id, side, quantity, client)
+                                         : limit(id, side, price, quantity, client);
+            const auto got = book.submitOrder(order);
+            const auto want = reference.submit(id, client, side,
+                                               isMarket ? OrderType::Market : OrderType::Limit,
+                                               price, quantity);
+            ASSERT_EQ(static_cast<int>(got.status), static_cast<int>(want.first)) << "step " << step;
+            ASSERT_EQ(got.remaining, want.second) << "step " << step;
+        }
+
+        ASSERT_EQ(book.restingOrderCount(), reference.restingCount()) << "step " << step;
+        ASSERT_EQ(book.heldMarketRemainderCount(), reference.heldCount()) << "step " << step;
+        ASSERT_EQ(book.bestBid(), reference.bestBid()) << "step " << step;
+        ASSERT_EQ(book.bestAsk(), reference.bestAsk()) << "step " << step;
+        ASSERT_EQ(book.priceLevelCount(Side::Buy), reference.levelCount(Side::Buy)) << "step " << step;
+        ASSERT_EQ(book.priceLevelCount(Side::Sell), reference.levelCount(Side::Sell)) << "step " << step;
+        // The book must never be left crossed: self-trade prevention removes overlaps.
+        if (book.bestBid() && book.bestAsk()) {
+            ASSERT_LT(*book.bestBid(), *book.bestAsk()) << "crossed book at step " << step;
+        }
     }
 }
 
-std::size_t countOccurrences(const std::string& text, std::string_view needle) {
-    std::size_t count = 0;
-    std::size_t position = 0;
-
-    while ((position = text.find(needle, position)) != std::string::npos) {
-        ++count;
-        position += needle.size();
-    }
-
-    return count;
-}
-
-std::string sellSection(const std::string& bookView) {
-    const auto start = bookView.find("SELLS (lowest price first)");
-    if (start == std::string::npos) {
-        return {};
-    }
-    return bookView.substr(start);
-}
-
-// Matches the first three transitions in the supplied picture in order.
-// The market-sell transition at the bottom of the picture is intentionally
-// omitted because that behavior is not part of the current test scope.
-void testPictureTransitionsOneThroughThree() {
-    std::cout << "\n[TEST] Picture transitions 1-3: add bid, add ask, partially fill and rest remainder\n";
-    OrderBook book("AAPL", 16);
-
-    std::cout << "  Setting up the initial book:\n";
-    std::cout << "    SELL 8 @ 10001 (order 101)\n";
-    const auto initialAsk = book.submitOrder(
-        Order("AAPL", 8, Side::Sell, OrderType::Limit, 10001, 1, 101));
-    std::cout << "    BUY 5 @ 10000 (order 102)\n";
-    const auto initialBid = book.submitOrder(
-        Order("AAPL", 5, Side::Buy, OrderType::Limit, 10000, 2, 102));
-
-    check(initialAsk.status == OrderBook::SubmitStatus::RestingInBook,
-          "Initial 8-share ask rests at 10001");
-    check(initialBid.status == OrderBook::SubmitStatus::RestingInBook,
-          "Initial 5-share bid rests at 10000");
-    std::cout << "  Initial order book:\n" << book.toString();
-
-    // Picture transition 1: add bid @ 100.00, size 7.
-    std::cout << "\n  [TRANSITION 1] Add BUY 7 @ 10000 (order 103)\n";
-    const auto addBid = book.submitOrder(
-        Order("AAPL", 7, Side::Buy, OrderType::Limit, 10000, 3, 103));
-    const std::string afterBid = book.toString();
-    std::cout << "  Result: status=" << statusName(addBid.status)
-              << ", remaining=" << addBid.remaining
-              << ", resting orders=" << book.restingOrderCount() << '\n';
-    std::cout << afterBid;
-
-    check(addBid.status == OrderBook::SubmitStatus::RestingInBook,
-          "New bid does not cross the 10001 ask and rests in the book");
-    check(addBid.remaining == 7,
-          "All 7 shares remain unfilled after adding the bid");
-    check(book.restingOrderCount() == 3,
-          "Three orders are resting after transition 1");
-    check(countOccurrences(afterBid, "Price 10000:") == 1,
-          "The existing 10000 bid level is reused instead of creating a duplicate level");
-    check(afterBid.find("Order #102") < afterBid.find("Order #103"),
-          "The older 5-share bid (102) remains ahead of the new 7-share bid (103), preserving FIFO");
-    check(afterBid.find("Order #101") != std::string::npos,
-          "The 8-share ask at 10001 remains untouched");
-
-    // Picture transition 2: add ask @ 100.02, size 3.
-    std::cout << "\n  [TRANSITION 2] Add SELL 3 @ 10002 (order 104)\n";
-    const auto addAsk = book.submitOrder(
-        Order("AAPL", 3, Side::Sell, OrderType::Limit, 10002, 4, 104));
-    const std::string afterAsk = book.toString();
-    const std::string asksAfterAsk = sellSection(afterAsk);
-    std::cout << "  Result: status=" << statusName(addAsk.status)
-              << ", remaining=" << addAsk.remaining
-              << ", resting orders=" << book.restingOrderCount() << '\n';
-    std::cout << afterAsk;
-
-    check(addAsk.status == OrderBook::SubmitStatus::RestingInBook,
-          "New ask at 10002 does not cross the best bid at 10000");
-    check(addAsk.remaining == 3,
-          "All 3 shares remain on the new ask at 10002");
-    check(book.restingOrderCount() == 4,
-          "Four orders are resting after transition 2");
-    check(asksAfterAsk.find("Price 10001:") != std::string::npos &&
-              asksAfterAsk.find("Price 10002:") != std::string::npos,
-          "The sell side contains both the 10001 and 10002 price levels");
-    check(asksAfterAsk.find("Price 10001:") < asksAfterAsk.find("Price 10002:"),
-          "Sell price levels are displayed from lowest ask to highest ask");
-
-    // Picture transition 3: buy 10 @ 100.01. It fills the 8-share ask,
-    // then rests its remaining 2 shares as a bid at 100.01.
-    std::cout << "\n  [TRANSITION 3] Add BUY 10 @ 10001 (order 105)\n";
-    const auto partialIncoming = book.submitOrder(
-        Order("AAPL", 10, Side::Buy, OrderType::Limit, 10001, 5, 105));
-    const std::string afterPartialFill = book.toString();
-    const std::string asksAfterFill = sellSection(afterPartialFill);
-    std::cout << "  Result: status=" << statusName(partialIncoming.status)
-              << ", remaining=" << partialIncoming.remaining
-              << ", resting orders=" << book.restingOrderCount() << '\n';
-    std::cout << afterPartialFill;
-
-    check(partialIncoming.status == OrderBook::SubmitStatus::RestingInBook,
-          "Incoming buy fills the eligible ask and rests its leftover limit quantity");
-    check(partialIncoming.remaining == 2,
-          "The incoming 10-share buy has exactly 2 shares remaining after filling 8");
-    check(afterPartialFill.find("Order #101") == std::string::npos,
-          "The fully filled 8-share ask (order 101) is removed from the book");
-    check(afterPartialFill.find("Order #105") != std::string::npos &&
-              afterPartialFill.find("remaining 2/10") != std::string::npos,
-          "The incoming order rests with 2 of its original 10 shares remaining");
-    check(book.restingOrderCount() == 4,
-          "Four resting orders remain after one ask is removed and the incoming remainder rests");
-    check(asksAfterFill.find("Price 10001:") == std::string::npos &&
-              asksAfterFill.find("Price 10002:") != std::string::npos,
-          "The empty 10001 ask level is removed while the 10002 ask remains");
-    check(afterPartialFill.find("Price 10001:") < afterPartialFill.find("Price 10000:"),
-          "The new 10001 bid is the best bid and appears before the 10000 bid level");
-    check(afterPartialFill.find("Order #102") < afterPartialFill.find("Order #103"),
-          "The original 10000 bids retain their FIFO order");
-    check(afterPartialFill.find("Order #104") != std::string::npos,
-          "The 3-share ask at 10002 remains unfilled");
-}
-
-// Additional case: FIFO matching at one price, including removal of a filled
-// resting order and cancellation of the partially filled order.
-void testFifoMatchingAndCancellation() {
-    std::cout << "\n[TEST] Additional case: FIFO matching and cancellation\n";
-    OrderBook book("AAPL", 16);
-
-    std::cout << "  Submitting SELL 40 @ 10000 (order 201)\n";
-    book.submitOrder(Order("AAPL", 40, Side::Sell, OrderType::Limit, 10000, 1, 201));
-    std::cout << "  Submitting SELL 30 @ 10000 (order 202)\n";
-    book.submitOrder(Order("AAPL", 30, Side::Sell, OrderType::Limit, 10000, 2, 202));
-    std::cout << "  Submitting BUY 60 @ 10000 (order 203)\n";
-    const auto result = book.submitOrder(
-        Order("AAPL", 60, Side::Buy, OrderType::Limit, 10000, 3, 203));
-
-    std::cout << "  Result: status=" << statusName(result.status)
-              << ", remaining=" << result.remaining
-              << ", resting orders=" << book.restingOrderCount() << '\n';
-    std::cout << book.toString();
-
-    check(result.status == OrderBook::SubmitStatus::FilledCompletely,
-          "The incoming 60-share buy is completely filled");
-    check(book.restingOrderCount() == 1,
-          "Only the partially filled second sell order remains");
-    check(book.toString().find("Order #201") == std::string::npos,
-          "The first sell order is removed after being completely filled");
-    check(book.toString().find("Order #202") != std::string::npos &&
-              book.toString().find("remaining 10/30") != std::string::npos,
-          "The second sell order remains with 10 of its original 30 shares");
-
-    std::cout << "  Cancelling 201 (expected: FAIL because it was fully filled)\n";
-    const bool canceled201 = book.cancel(201);
-    std::cout << "  Actual cancel() return: " << (canceled201 ? "true" : "false")
-              << " (expected false)\n";
-    check(!canceled201, "A fully filled order cannot be canceled");
-
-    std::cout << "  Cancelling 202 (expected: SUCCESS because 10 shares remain)\n";
-    const bool canceled202 = book.cancel(202);
-    std::cout << "  Actual cancel() return: " << (canceled202 ? "true" : "false")
-              << " (expected true)\n";
-    check(canceled202, "A partially filled resting order can be canceled");
-    check(book.restingOrderCount() == 0,
-          "The book is empty after the remaining resting order is canceled");
-}
-
-// Additional case: test the current pseudocode's explicitly held market-buy
-// remainder. This is not the market-sell transition shown at the bottom of the picture.
-void testMarketBuyRemainderIsHeld() {
-    std::cout << "\n[TEST] Additional case: market-buy remainder is held outside the book\n";
-    OrderBook book("AAPL", 16);
-
-    std::cout << "  Submitting SELL 60 @ 10000 (order 301)\n";
-    book.submitOrder(Order("AAPL", 60, Side::Sell, OrderType::Limit, 10000, 1, 301));
-    std::cout << "  Submitting SELL 40 @ 10001 (order 302)\n";
-    book.submitOrder(Order("AAPL", 40, Side::Sell, OrderType::Limit, 10001, 2, 302));
-    std::cout << "  Submitting MARKET BUY 200 (order 303)\n";
-    const auto result = book.submitOrder(
-        Order("AAPL", 200, Side::Buy, OrderType::Market, 0, 3, 303));
-
-    std::cout << "  Result: status=" << statusName(result.status)
-              << ", remaining=" << result.remaining
-              << ", held market orders=" << book.heldMarketRemainderCount()
-              << ", resting orders=" << book.restingOrderCount() << '\n';
-    std::cout << book.toString();
-
-    check(result.status == OrderBook::SubmitStatus::MarketRemainderHeld,
-          "The unfilled market-buy remainder is held per current pseudocode");
-    check(result.remaining == 100,
-          "100 shares remain after consuming the 100 available shares");
-    check(book.heldMarketRemainderCount() == 1,
-          "One market order is held outside the book");
-    check(book.restingOrderCount() == 0,
-          "The held market order is not counted as a resting order");
-    std::cout << "  Cancelling held order 303 (expected: FAIL; it is not resting)\n";
-    const bool canceled303 = book.cancel(303);
-    std::cout << "  Actual cancel() return: " << (canceled303 ? "true" : "false")
-              << " (expected false)\n";
-    check(!canceled303, "A held market order is not cancelable through the resting-order map");
-}
-
-// Additional case: an order for another ticker must not enter this book.
-void testWrongTickerIsIgnored() {
-    std::cout << "\n[TEST] Additional case: wrong ticker is ignored\n";
-    OrderBook book("AAPL", 16);
-
-    std::cout << "  Submitting BUY 10 MSFT @ 10000 (order 401) to an AAPL book\n";
-    const auto result = book.submitOrder(
-        Order("MSFT", 10, Side::Buy, OrderType::Limit, 10000, 1, 401));
-    std::cout << "  Result: status=" << statusName(result.status)
-              << ", resting orders=" << book.restingOrderCount() << '\n';
-    std::cout << book.toString();
-
-    check(result.status == OrderBook::SubmitStatus::IgnoredWrongTicker,
-          "The MSFT order is ignored by the AAPL order book");
-    check(book.restingOrderCount() == 0,
-          "The wrong-ticker order is not added to the book");
-}
-
-} // namespace
-
-int main() {
-    std::cout << "Running OrderBook tests...\n";
-    std::cout << "Prices are shown as integer ticks (10001 represents $100.01 if one tick is $0.01).\n";
-
-    testPictureTransitionsOneThroughThree();
-    testFifoMatchingAndCancellation();
-    testMarketBuyRemainderIsHeld();
-    testWrongTickerIsIgnored();
-
-    std::cout << "\n========================================\n";
-    std::cout << "Checks run: " << checksRun << '\n';
-    std::cout << "Checks failed: " << checksFailed << '\n';
-    if (checksFailed == 0) {
-        std::cout << "[PASS] All OrderBook tests passed.\n";
-        return 0;
-    }
-
-    std::cout << "[FAIL] Some OrderBook tests failed.\n";
-    return 1;
-}
+}  // namespace
