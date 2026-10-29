@@ -7,6 +7,8 @@
 // Keep hot objects cache-local in a contiguous vector?
 // Avoid any per-allocation overhead
 
+#pragma once
+
 #include <vector>
 #include <cstddef>
 #include <cstdint>    // CHANGE: Added for std::uint32_t pool indices.

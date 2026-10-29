@@ -1,7 +1,7 @@
 #pragma once
 
-#include "./oct12/mem_pool.h"
-#include "order.h"
+#include "../../oct12/mem_pool.h"
+#include "../order.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -141,6 +141,10 @@ public:
         out << "SELLS (lowest price first)\n";
         writeSide(out, sells_);
         return out.str();
+    }
+
+    std::size_t priceLevelCount(Side side) const noexcept {
+        return side == Side::Buy ? buys_.size() : sells_.size();
     }
 
 private:

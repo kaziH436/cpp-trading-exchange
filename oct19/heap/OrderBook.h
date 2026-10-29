@@ -11,8 +11,8 @@
 //   cancel that empties a price : O(L) scan + O(L) rebuild (make_heap)
 // L = number of distinct prices on that side.
 
-#include "./oct12/mem_pool.h"
-#include "order.h"
+#include "../../oct12/mem_pool.h"
+#include "../order.h"
 
 #include <algorithm>
 #include <compare>

@@ -8,9 +8,9 @@
 //
 // Usage: order_bench [ops] [poolCapacity] [repeats]
 
-#include "heap/OrderBook.h"
-#include "heap_hash/OrderBook.h"
-#include "map/OrderBookMap.h"
+#include "../heap/OrderBook.h"
+#include "../heap_hash/OrderBook.h"
+#include "../map/OrderBookMap.h"
 
 #include <algorithm>
 #include <chrono>
