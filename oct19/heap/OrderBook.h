@@ -13,7 +13,7 @@
 //
 // Features added on top of the basic book:
 //   update(orderId, newQuantity)  down-size keeps the queue spot, up-size goes to the back
-//   disconnect(clientId)          cancel every order (resting and held) a client owns
+//   disconnect(clientId)          cancel every order (resting and held) a client owns and remove from order ID hastable and mem pool?
 //   self-trade prevention         decrement-and-cancel, see matchOne()
 
 #include "../../oct12/mem_pool.h"
@@ -31,6 +31,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// lazy canceling? seq numbering needed to understand ordering of order? 
 
 class OrderBookHeap {
 public:

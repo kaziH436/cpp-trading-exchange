@@ -7,6 +7,8 @@
 // Keep hot objects cache-local in a contiguous vector?
 // Avoid any per-allocation overhead
 
+
+//using a vector instead of a linked list to find free spaces?
 #pragma once
 
 #include <vector>

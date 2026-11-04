@@ -45,9 +45,9 @@ public:
     Quantity  remaining = 0;                     // quantity still unfilled
     Side      side      = Side::Buy;
     OrderType type      = OrderType::Limit;
-    Price     price     = 0;                     // ignored for market orders
-    ClientId  clientId  = 0;
-    OrderId   orderId   = 0;
+    int64_t     price     = 0;                     // ignored for market orders
+    uint32_t  clientId  = 0;
+    uint32_t   orderId   = 0;
 
     // Links for the per-price-level doubly linked list (indices into the pool).
     std::uint32_t prev = kNullIndex;
